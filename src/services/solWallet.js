@@ -1,0 +1,333 @@
+/**
+ * Wallet + copy-trade execution on Solana MAINNET.
+ *
+ * The app's wallet surface:
+ *   connectWallet / getConnectedAccount / getMonBalance (native SOL balance)
+ *   copyBuy (SOL -> whale's token) / sellToken (token -> SOL)
+ *
+ * Execution path is 100% real: Phantom wallet signs a live Jupiter aggregator
+ * transaction (lite-api.jup.ag). No mock data, no simulated fills.
+ */
+import { VersionedTransaction } from '@solana/web3.js';
+import { CHAINS, DEFAULT_SLIPPAGE_BPS } from '../config/chain.js';
+
+const SOL = CHAINS.solana;
+const RPC_URL = SOL.rpcUrl;
+const JUP = SOL.jupiterApi;
+const WSOL = SOL.nativeToken; // So1111...1112 — Jupiter treats it as native SOL with wrapAndUnwrapSol
+// Fee headroom: tx fee + priority fee + ATA rent (~0.002 SOL) for first-time tokens
+const FEE_BUFFER_SOL = 0.01;
+
+export const WALLET_NAME = 'Phantom';
+export const WALLET_INSTALL_URL = 'https://phantom.com/download';
+
+const BASE58 = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+function provider() {
+  if (typeof window === 'undefined') return null;
+  const p = window.phantom?.solana ?? (window.solana?.isPhantom ? window.solana : null);
+  return p || null;
+}
+
+export function isWalletAvailable() {
+  return !!provider();
+}
+
+// ── raw JSON-RPC to Solana mainnet (exported for the Turbo trading wallet) ──
+// A hard timeout keeps a hung / rate-limited public RPC from freezing the app.
+let rpcId = 0;
+export async function rpc(method, params = []) {
+  const res = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, params }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(res.status === 403 ? 'RPC_FORBIDDEN' : `RPC_HTTP_${res.status}`);
+  const j = await res.json();
+  if (j.error) throw new Error(j.error.message || 'RPC_ERROR');
+  return j.result;
+}
+
+export async function connectWallet() {
+  const p = provider();
+  if (!p) throw new Error('NO_WALLET_EXTENSION');
+  const resp = await p.connect();
+  const pk = (resp?.publicKey ?? p.publicKey)?.toString();
+  if (!pk) throw new Error('NO_ACCOUNTS');
+  return pk; // base58 is case-sensitive — never lowercase
+}
+
+/**
+ * Sign a plain-text message with Phantom (gasless, no tx). Deterministic per
+ * account — the seed the Turbo trading wallet is derived from. Returns the raw
+ * 64-byte Ed25519 signature (Uint8Array).
+ */
+export async function signMessage(address, message) {
+  const encoded = new TextEncoder().encode(message);
+
+  // Privy's Solana wallets implement the Standard Wallet interface — they expose
+  // signMessage({message}) directly and have NO getSolanaProvider(), so calling
+  // for a provider here always threw and silently fell through to Phantom (which
+  // is exactly the extension prompt a social-login user should never see).
+  const pw = window.activePrivyWallet;
+  if (pw && typeof pw.signMessage === 'function' && (!address || pw.address === address)) {
+    const res = await pw.signMessage({ message: encoded });
+    const sig = res?.signature ?? res;
+    return sig instanceof Uint8Array ? sig : Uint8Array.from(sig);
+  }
+
+  const p = provider();
+  if (!p) throw new Error('NO_PHANTOM');
+  const res = await p.signMessage(encoded, 'utf8');
+  const sig = res?.signature ?? res;
+  return sig instanceof Uint8Array ? sig : Uint8Array.from(sig);
+}
+
+export async function getConnectedAccount() {
+  // The EXTERNAL (linked) wallet only — the embedded wallet is the account, not
+  // a connected wallet (see wallet.js getConnectedAccount for the full note).
+  if (window.activeExternalWallet) return window.activeExternalWallet.address;
+  const p = provider();
+  if (!p || !p.publicKey) return null;
+  return p.publicKey.toString();
+}
+
+export async function disconnectWallet() {
+  try { await provider()?.disconnect(); } catch { /* already disconnected */ }
+}
+
+/** Subscribe to wallet account changes. Returns an unsubscribe fn. */
+export function onAccountsChanged(cb) {
+  const p = provider();
+  if (!p) return () => {};
+  const onChange = (pk) => cb(pk ? [pk.toString()] : []);
+  const onDisc = () => cb([]);
+  p.on('accountChanged', onChange);
+  p.on('disconnect', onDisc);
+  return () => {
+    try { p.removeListener?.('accountChanged', onChange); p.removeListener?.('disconnect', onDisc); } catch {}
+  };
+}
+
+/** Native balance in SOL (name kept for cross-chain interface parity). */
+export async function getMonBalance(address) {
+  try {
+    const r = await rpc('getBalance', [address]);
+    return (r?.value ?? 0) / 1e9;
+  } catch {
+    return null;
+  }
+}
+
+// ── Jupiter aggregator (live quotes + executable transactions) ──
+
+export async function jupQuote(inputMint, outputMint, amountRaw, slippageBps) {
+  const url = `${JUP}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountRaw}&slippageBps=${slippageBps}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(12000) });
+  const q = await res.json();
+  if (!res.ok || q.error || !q.outAmount) return null;
+  return q;
+}
+
+export async function jupSwapTx(quoteResponse, userPublicKey) {
+  const res = await fetch(`${JUP}/swap`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(15000),
+    body: JSON.stringify({
+      quoteResponse, userPublicKey, wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      // A real priority fee is what makes the swap actually LAND on a congested
+      // mainnet (esp. via the rate-limited public RPC) instead of silently
+      // timing out. Jupiter auto-sizes it up to this cap.
+      prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: 2000000, priorityLevel: 'high', global: false } },
+    }),
+  });
+  const j = await res.json();
+  if (!res.ok || !j.swapTransaction) throw new Error(j.error || 'SWAP_BUILD_FAILED');
+  // lastValidBlockHeight lets the sender/confirmer know when the blockhash dies
+  return { swapTransaction: j.swapTransaction, lastValidBlockHeight: j.lastValidBlockHeight };
+}
+
+// Robust raw-send for locally-signed txs (the Turbo path). Broadcasts with
+// skipPreflight (public RPC preflight is flaky/rate-limited), re-broadcasts
+// while we wait, and confirms against the tx's lastValidBlockHeight so a
+// dropped tx fails fast instead of hanging. Returns the signature.
+export async function sendRawTransaction(signedTxBytes, lastValidBlockHeight) {
+  const b64 = btoa(String.fromCharCode(...signedTxBytes));
+  const send = () => rpc('sendTransaction', [b64, { encoding: 'base64', skipPreflight: true, maxRetries: 2, preflightCommitment: 'confirmed' }]);
+  let signature = await send();
+  const started = Date.now();
+  while (Date.now() - started < 60000) {
+    try {
+      const r = await rpc('getSignatureStatuses', [[signature], { searchTransactionHistory: true }]);
+      const st = r?.value?.[0];
+      if (st) {
+        if (st.err) throw Object.assign(new Error('TX_FAILED'), { signature });
+        if (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized') return signature;
+      } else if (lastValidBlockHeight) {
+        // no status yet — if the blockhash has expired the tx will never land
+        try {
+          const h = await rpc('getBlockHeight', [{ commitment: 'confirmed' }]);
+          if (h > lastValidBlockHeight) throw Object.assign(new Error('TX_TIMEOUT'), { signature });
+        } catch (e) { if (e.message === 'TX_TIMEOUT') throw e; }
+      }
+    } catch (e) {
+      if (e.message === 'TX_FAILED' || e.message === 'TX_TIMEOUT') throw e;
+    }
+    // keep re-broadcasting — public RPC drops txs from its mempool aggressively
+    try { await send(); } catch { /* ignore, we already have a signature */ }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw Object.assign(new Error('TX_TIMEOUT'), { signature });
+}
+
+async function signAndSend(swapTxB64) {
+  const p = provider();
+  if (!p) throw new Error('NO_WALLET_EXTENSION');
+  const bytes = Uint8Array.from(atob(swapTxB64), (c) => c.charCodeAt(0));
+  const tx = VersionedTransaction.deserialize(bytes);
+  const { signature } = await p.signAndSendTransaction(tx);
+  return signature;
+}
+
+/**
+ * Wait until the signature is confirmed ON-CHAIN. A signed-and-sent tx is not
+ * a trade — only a confirmed one is. Throws TX_FAILED if it landed with an
+ * error, TX_TIMEOUT if it never confirmed.
+ */
+export async function confirmOnChain(signature, timeoutMs = 60000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const r = await rpc('getSignatureStatuses', [[signature], { searchTransactionHistory: true }]);
+      const st = r?.value?.[0];
+      if (st) {
+        if (st.err) throw Object.assign(new Error('TX_FAILED'), { signature });
+        if (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized') return st;
+      }
+    } catch (e) {
+      if (e.message === 'TX_FAILED') throw e; // real on-chain failure — surface it
+      /* transient RPC error — keep polling */
+    }
+    await new Promise((res) => setTimeout(res, 1500));
+  }
+  throw Object.assign(new Error('TX_TIMEOUT'), { signature });
+}
+
+/** Real token amount the owner received/spent in a confirmed tx (raw units). */
+export async function actualTokenDelta(signature, owner, mint) {
+  try {
+    const tx = await rpc('getTransaction', [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]);
+    if (!tx?.meta) return null;
+    const sum = (arr) => (arr || [])
+      .filter((b) => b.owner === owner && b.mint === mint)
+      .reduce((s, b) => s + BigInt(b.uiTokenAmount?.amount || '0'), 0n);
+    const delta = sum(tx.meta.postTokenBalances) - sum(tx.meta.preTokenBalances);
+    return delta > 0n ? delta.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function dexLabel(quote) {
+  const labels = [...new Set((quote.routePlan || []).map((r) => r.swapInfo?.label).filter(Boolean))];
+  return labels.length ? labels.join('+') : 'Jupiter';
+}
+
+export async function mintDecimals(mint) {
+  try {
+    const r = await rpc('getTokenSupply', [mint]);
+    return r?.value?.decimals ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Copy a whale's buy: SOL -> tokenMint via Jupiter, signed by Phantom.
+ * Returns { hash, dex, fee, amountOutMin, expectedOut, decimals } — same shape
+ * as the EVM copyBuy (plus decimals, which Solana can resolve on the fly).
+ */
+export async function copyBuy(from, tokenMint, amountSol, opts = {}) {
+  if (!tokenMint || !BASE58.test(tokenMint)) throw new Error('NO_TOKEN_ADDRESS');
+  const slippageBps = opts.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+  const lamports = Math.round(amountSol * 1e9);
+
+  // Pre-flight: SOL pays the swap AND fees/rent — fail with clear numbers
+  // instead of prompting a doomed Phantom confirmation. Retry once so a
+  // transient RPC hiccup can't skip the check.
+  let balance = await getMonBalance(from);
+  if (balance == null) { await new Promise((r) => setTimeout(r, 800)); balance = await getMonBalance(from); }
+  if (balance == null) throw new Error('BALANCE_UNKNOWN'); // can't verify funds — refuse to prompt a blind trade
+  if (balance < amountSol + FEE_BUFFER_SOL) {
+    throw Object.assign(new Error('INSUFFICIENT_FUNDS'), {
+      needMon: amountSol + FEE_BUFFER_SOL, haveMon: balance, gasMon: FEE_BUFFER_SOL,
+    });
+  }
+
+  const quote = await jupQuote(WSOL, tokenMint, lamports, slippageBps);
+  if (!quote) throw new Error('NO_LIQUIDITY');
+
+  const [{ swapTransaction }, decimals] = await Promise.all([jupSwapTx(quote, from), mintDecimals(tokenMint)]);
+  const hash = await signAndSend(swapTransaction);
+  await confirmOnChain(hash); // throws if the swap failed on-chain — no fake fills
+  // Position size = tokens actually received on-chain, not the quote's estimate
+  const realOut = await actualTokenDelta(hash, from, tokenMint);
+  return {
+    hash,
+    dex: dexLabel(quote),
+    fee: null,
+    amountOutMin: quote.otherAmountThreshold,
+    expectedOut: realOut ?? quote.outAmount,
+    decimals,
+  };
+}
+
+/** SPL token balance for a wallet: { raw: BigInt, decimals }. */
+export async function getTokenInfo(user, mint) {
+  const r = await rpc('getTokenAccountsByOwner', [user, { mint }, { encoding: 'jsonParsed' }]);
+  let raw = 0n;
+  let decimals = 9;
+  for (const acc of r?.value || []) {
+    const t = acc.account?.data?.parsed?.info?.tokenAmount;
+    if (!t) continue;
+    raw += BigInt(t.amount || '0');
+    decimals = t.decimals ?? decimals;
+  }
+  return { raw, decimals };
+}
+
+/**
+ * Sell a token back to native SOL (closes/reduces a copied position).
+ * opts: { slippageBps, amountRaw } — amountRaw defaults to full balance.
+ * Returns { hash, dex, fee, amountIn, expectedOut, amountOutMin }.
+ */
+export async function sellToken(from, tokenMint, opts = {}) {
+  if (!tokenMint || !BASE58.test(tokenMint)) throw new Error('NO_TOKEN_ADDRESS');
+  const slippageBps = opts.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
+
+  const { raw: balance } = await getTokenInfo(from, tokenMint);
+  if (balance <= 0n) throw new Error('NO_BALANCE');
+
+  let amountIn = balance;
+  if (opts.amountRaw) {
+    try { const want = BigInt(opts.amountRaw); if (want > 0n && want < balance) amountIn = want; } catch { /* full balance */ }
+  }
+
+  const quote = await jupQuote(tokenMint, WSOL, amountIn.toString(), slippageBps);
+  if (!quote) throw new Error('NO_LIQUIDITY');
+
+  const { swapTransaction } = await jupSwapTx(quote, from);
+  const hash = await signAndSend(swapTransaction);
+  await confirmOnChain(hash); // position is only "closed" once the sell landed on-chain
+  return {
+    hash,
+    dex: dexLabel(quote),
+    fee: null,
+    amountIn: amountIn.toString(),
+    expectedOut: quote.outAmount,
+    amountOutMin: quote.otherAmountThreshold,
+  };
+}

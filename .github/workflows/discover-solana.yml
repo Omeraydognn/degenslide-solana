@@ -1,0 +1,62 @@
+name: Grow Solana smart money
+
+# The Render free tier has an ephemeral disk + sleeps mid-scan, so the server's
+# own GMGN discovery can't persist new whales. This workflow does the durable
+# growth instead: on a schedule it runs the GMGN sweep, exports the registry,
+# and commits the grown DB + curated file. The push redeploys Vercel/Render, so
+# the new Smart Money goes live automatically.
+#
+# Required repo secrets (Settings → Secrets → Actions):
+#   GMGN_API_KEY, GMGN_PRIVATE_KEY   — your GMGN OpenAPI credentials
+#   SOLANA_RPC (optional)            — a dedicated RPC; defaults to PublicNode
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'   # twice a day
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: discover-solana
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install backend deps
+        working-directory: backend
+        run: npm ci
+
+      - name: Run GMGN discovery + export
+        working-directory: backend
+        env:
+          GMGN_API_KEY: ${{ secrets.GMGN_API_KEY }}
+          GMGN_PRIVATE_KEY: ${{ secrets.GMGN_PRIVATE_KEY }}
+          SOLANA_RPC: ${{ secrets.SOLANA_RPC || 'https://solana-rpc.publicnode.com' }}
+          GMGN_MAX_NEW: '400'
+        run: |
+          node gmgnSync.js
+          node exportSolRegistry.js
+          sqlite3 solWhales.db "PRAGMA wal_checkpoint(TRUNCATE);" || true
+
+      - name: Commit grown registry
+        run: |
+          git config user.name  "degen-discovery-bot"
+          git config user.email "bot@degenslide.local"
+          git add backend/solWhales.db src/data/curatedSolWhales.json
+          if git diff --cached --quiet; then
+            echo "No new whales this run."
+          else
+            count=$(node -e "console.log(require('./src/data/curatedSolWhales.json').count)")
+            git commit -m "chore(discovery): grow Solana smart money to ${count} whales [skip ci]"
+            git push
+          fi

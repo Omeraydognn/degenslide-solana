@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/VICTUS/OneDrive/Documents/Masa�st�/**)",
+      "Skill(run)",
+      "Skill(run:*)",
+      "WebFetch(domain:localhost)",
+      "Bash(npm run *)",
+      "PowerShell(head -5)",
+      "PowerShell(git rm -r --cached node_modules 2>&1)",
+      "PowerShell(git add .gitignore)",
+      "PowerShell(git push)"
+    ]
+  }
+}

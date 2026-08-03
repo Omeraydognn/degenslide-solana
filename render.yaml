@@ -1,0 +1,44 @@
+services:
+  # Live service (deployed manually on Render — the name matches the live URL):
+  #   Solana → https://deepswap-solana-bot-h10w.onrender.com
+  #
+  # Free plan → no persistent disk. Durability comes from the repo itself:
+  # the whale registry DB (backend/solWhales.db) and the curated JSON ship with
+  # every deploy, and loadRoster() re-seeds the registry from them on boot.
+  # If you upgrade, add a disk (mountPath /data) + WHALE_DB=/data/solWhales.db.
+  - type: web
+    name: deepswap-solana-bot-h10w
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    rootDir: backend
+    envVars:
+      - key: SOLANA_RPC
+        value: https://api.mainnet-beta.solana.com
+      - key: WHALE_MIN_USD
+        value: 500
+      # ── Real-time whale tracking via Helius webhook (see backend/heliusWebhook.js) ──
+      # Set these in the Render dashboard (sync:false = not stored in the repo).
+      # PUBLIC_URL is auto-derived from RENDER_EXTERNAL_URL, which Render injects.
+      - key: HELIUS_API_KEY        # free-tier key from dashboard.helius.dev
+        sync: false
+      - key: HELIUS_WEBHOOK_SECRET # any random string — rejects forged webhook POSTs
+        sync: false
+      # ── Optional extra whale-discovery sources (backend/discoverySources.js) ──
+      # Each is gated on its key — set any to activate that source; none = GMGN only.
+      - key: BIRDEYE_API_KEY
+        sync: false
+      - key: SOLANATRACKER_API_KEY
+        sync: false
+      - key: CIELO_API_KEY
+        sync: false
+      # ── Optional tunables (code defaults in solListener.js; set only to override) ──
+      # Phase-2B FREE network-wide detection (pump.fun log subscription):
+      #   SOL_NETWORK_SCAN (1)     set 0 to disable if a constrained box struggles
+      #   SOL_WS (public node)     logsSubscribe WS endpoint; default burns NO Helius credits
+      #   NETWORK_MIN_USD (1000)   pump.fun trade size to become a promotion candidate
+      #   NETWORK_MIN_HITS (2)     repeat whale-size trades before promoting (fluke filter)
+      # Phase-2A discovery + pruning:
+      #   GMGN_SYNC_MINUTES (20)   discovery sweep cadence
+      #   PRUNE_DAYS (60)          on-chain-dormant days before a NON-proven wallet is pruned
+      # Deck: RECENT_CAP (300)     history depth so cards persist longer

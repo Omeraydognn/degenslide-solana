@@ -1,0 +1,16 @@
+{
+  "name": "degen-slide-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "solListener.js",
+  "scripts": {
+    "start": "node solListener.js",
+    "dev": "node solListener.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "gmgn-cli": "^1.5.1",
+    "ws": "^8.18.0"
+  }
+}
