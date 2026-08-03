@@ -613,10 +613,21 @@ function initFromDb() {
 }
 
 // ── HTTP API ──
-// Locked to the real production frontend (+ local dev) instead of '*' — see
-// listener.js for why. Override/extend via ALLOWED_ORIGINS (CSV).
+// Locked to the real production frontends (+ local dev) instead of '*': a wide-
+// open feed is free to scrape and to hammer. Override/extend via ALLOWED_ORIGINS
+// (CSV) — that env var REPLACES this default, so list every origin you need.
+// 4173/4174 are `vite preview` (the production build served locally); without
+// them a real build can't be smoke-tested against this indexer.
+const DEFAULT_ORIGINS = [
+  'https://degenslide-solana.vercel.app',
+  'https://deepswap-zeta.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:4173',
+  'http://localhost:4174',
+].join(',');
 const ALLOWED_ORIGINS = new Set(
-  (process.env.ALLOWED_ORIGINS || 'https://deepswap-zeta.vercel.app,http://localhost:5173,http://localhost:5174')
+  (process.env.ALLOWED_ORIGINS || DEFAULT_ORIGINS)
     .split(',').map((s) => s.trim()).filter(Boolean),
 );
 function corsHeadersFor(origin) {

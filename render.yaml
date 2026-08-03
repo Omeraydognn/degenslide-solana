@@ -17,6 +17,10 @@ services:
         value: https://api.mainnet-beta.solana.com
       - key: WHALE_MIN_USD
         value: 500
+      # CORS allowlist (CSV). REPLACES the code default in solListener.js, so
+      # list every frontend origin — production domain + any preview domains.
+      - key: ALLOWED_ORIGINS
+        value: https://degenslide-solana.vercel.app,http://localhost:5173,http://localhost:5174,http://localhost:4173,http://localhost:4174
       # ── Real-time whale tracking via Helius webhook (see backend/heliusWebhook.js) ──
       # Set these in the Render dashboard (sync:false = not stored in the repo).
       # PUBLIC_URL is auto-derived from RENDER_EXTERNAL_URL, which Render injects.
