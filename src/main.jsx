@@ -40,7 +40,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(
           appearance: {
             theme: 'dark',
             accentColor: '#6db48a',
-            logo: 'https://degenslide.com/logo.png', // Replace with your actual logo later
+            // Served from whatever origin the app is on (production, preview or
+            // localhost). It used to be a hardcoded degenslide.com URL, which no
+            // longer resolves — the login modal rendered a broken image.
+            logo: `${window.location.origin}/logo.png`,
           },
           // Privy v3 reads embeddedWallets.<chain>.createOnLogin — the flat
           // `createOnLogin` of v1/v2 is an unknown key here and is silently
